@@ -12,14 +12,7 @@
 #include <setjmp.h>
 #include <time.h>
 #include <math.h>
-#include <windows.h>
-#include <windowsx.h>
-
-#ifdef _MSC_VER
-#pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "winmm.lib")
-#endif
+#include <SDL2/SDL.h>  
 
 enum {
     KIT_SCALE2X    = (1 << 0),
@@ -55,8 +48,10 @@ typedef struct {
     kit_Image *screen;
     // windows
     int win_w, win_h;
-    HWND hwnd;
-    HDC hdc;
+    SDL_Window* window;
+    SDL_Renderer* renderer;
+    SDL_Texture* texture;
+
 } kit_Context;
 
 #define kit_max(a, b) ((a) > (b) ? (a) : (b))
@@ -159,7 +154,7 @@ static double kit__flags_to_step_time(int flags) {
 }
 
 static double kit__now(void) {
-    return clock() / 1000.0;
+    return SDL_GetTicks64() / 1000.0;
 }
 
 
@@ -214,109 +209,64 @@ static kit_Rect kit__get_adjusted_window_rect(kit_Context *ctx) {
 }
 
 
-static LRESULT CALLBACK kit__wndproc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    kit_Context *ctx = (void*) GetProp(hWnd, "kit_Context");
+static void kit__wndproc(kit_Context *ctx, SDL_Event *e) {
 
-    switch (message) {
-    case WM_PAINT:;
-        BITMAPINFO bmi = {
-            .bmiHeader.biSize = sizeof(BITMAPINFOHEADER),
-            .bmiHeader.biBitCount = 32,
-            .bmiHeader.biCompression = BI_RGB,
-            .bmiHeader.biPlanes = 1,
-            .bmiHeader.biWidth = ctx->screen->w,
-            .bmiHeader.biHeight = -ctx->screen->h
-        };
+    switch (e->type) {
 
-        kit_Rect wr = kit__get_adjusted_window_rect(ctx);
-
-        StretchDIBits(ctx->hdc,
-            wr.x, wr.y, wr.w, wr.h,
-            0, 0, ctx->screen->w, ctx->screen->h,
-            ctx->screen->pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
-
-        ValidateRect(hWnd, 0);
+    case SDL_KEYDOWN:
+        ctx->key_state[(uint8_t) e->key.keysym.sym] = KIT_INPUT_DOWN | KIT_INPUT_PRESSED;
         break;
 
-    case WM_SETCURSOR:
-        if (ctx->hide_cursor && LOWORD(lParam) == HTCLIENT) {
-            SetCursor(0);
-            break;
-        }
-        goto unhandled;
-
-    case WM_KEYDOWN:
-    case WM_SYSKEYDOWN:
-        if (lParam & (1 << 30)) { // key repeat
-            break;
-        }
-        ctx->key_state[(uint8_t) wParam] = KIT_INPUT_DOWN | KIT_INPUT_PRESSED;
+    case SDL_KEYUP:
+        ctx->key_state[(uint8_t) e->key.keysym.sym] &= ~KIT_INPUT_DOWN;
+        ctx->key_state[(uint8_t) e->key.keysym.sym] |= KIT_INPUT_RELEASED;
         break;
 
-    case WM_KEYUP:
-    case WM_SYSKEYUP:
-        ctx->key_state[(uint8_t) wParam] &= ~KIT_INPUT_DOWN;
-        ctx->key_state[(uint8_t) wParam] |= KIT_INPUT_RELEASED;
-        break;
-
-    case WM_CHAR:
-        if (wParam < 32) { break; }
-        for (int i = 0; i < kit_lengthof(ctx->char_buf); i++) {
+    case SDL_TEXTINPUT:
+        for (int i,j = 0; i < kit_lengthof(ctx->char_buf); i++) {
             if (ctx->char_buf[i]) { continue; }
-            ctx->char_buf[i] = wParam;
-            break;
+            if (! e->text.text[j]) { break; }
+            ctx->char_buf[i] = e->text.text[j];
+            j++;
         }
         break;
 
-    case WM_LBUTTONDOWN: case WM_LBUTTONUP:
-    case WM_RBUTTONDOWN: case WM_RBUTTONUP:
-    case WM_MBUTTONDOWN: case WM_MBUTTONUP:;
-        int button = (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP) ? 1 :
-                     (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 2 : 3;
-        if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN) {
-            SetCapture(hWnd);
-            ctx->mouse_state[button] = KIT_INPUT_DOWN | KIT_INPUT_PRESSED;
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP:
+        if (e->button.state == SDL_PRESSED) {
+            SDL_CaptureMouse(true);
+            ctx->mouse_state[e->button.button] = KIT_INPUT_DOWN | KIT_INPUT_PRESSED;
         } else {
-            ReleaseCapture();
-            ctx->mouse_state[button] &= ~KIT_INPUT_DOWN;
+            SDL_CaptureMouse(false);
+            ctx->mouse_state[e->button.button] &= ~KIT_INPUT_DOWN;
         }
         // fallthrough
 
-    case WM_MOUSEMOVE:;
-        wr = kit__get_adjusted_window_rect(ctx);
+    case SDL_MOUSEMOTION:;
+        kit_Rect wr = kit__get_adjusted_window_rect(ctx);
         int prevx = ctx->mouse_pos.x;
         int prevy = ctx->mouse_pos.y;
-        ctx->mouse_pos.x = (GET_X_LPARAM(lParam) - wr.x) * ctx->screen->w / wr.w;
-        ctx->mouse_pos.y = (GET_Y_LPARAM(lParam) - wr.y) * ctx->screen->h / wr.h;
+        int mx,my;
+        SDL_GetMouseState( &mx, &my );
+        ctx->mouse_pos.x = (mx - wr.x) * ctx->screen->w / wr.w;
+        ctx->mouse_pos.y = (my - wr.y) * ctx->screen->h / wr.h;
         ctx->mouse_delta.x += ctx->mouse_pos.x - prevx;
         ctx->mouse_delta.y += ctx->mouse_pos.y - prevy;
         break;
 
-    case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED) {
+    case SDL_WINDOWEVENT:
+        switch (e->window.event) {
+        case SDL_WINDOWEVENT_RESIZED:
             // set size
-            ctx->win_w = LOWORD(lParam);
-            ctx->win_h = HIWORD(lParam);
-            // paint window black
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
-            FillRect(hdc, &ps.rcPaint, brush);
-            DeleteObject(brush);
-            EndPaint(hWnd, &ps);
-            // redraw
-            RedrawWindow(ctx->hwnd, 0, 0, RDW_INVALIDATE | RDW_UPDATENOW);
+            ctx->win_w = e->window.data1;
+            ctx->win_h = e->window.data2;
+            break;
         }
         break;
 
-    case WM_QUIT:
-    case WM_CLOSE:
+    case SDL_QUIT:
         ctx->wants_quit = true;
         break;
-
-    default:
-unhandled:
-        return DefWindowProc(hWnd, message, wParam, lParam);
     }
 
     return 0;
@@ -334,30 +284,24 @@ kit_Context* kit_create(const char *title, int w, int h, int flags) {
     ctx->hide_cursor = !!(flags & KIT_HIDECURSOR);
     ctx->clip = kit_rect(0, 0, w, h);
 
-    RegisterClass(&(WNDCLASS) {
-        .style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
-        .lpfnWndProc = kit__wndproc,
-        .hCursor = LoadCursor(0, IDC_ARROW),
-        .lpszClassName = title,
-        .hIcon = LoadIcon(GetModuleHandle(0), "icon"),
-    });
-
     kit__scale_size_by_flags(&w, &h, flags);
-    RECT rect = { .right = w, .bottom = h };
-    int style = WS_OVERLAPPEDWINDOW;
-    AdjustWindowRect(&rect, style, 0);
-    ctx->hwnd = CreateWindow(
-        title, title, style,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        rect.right - rect.left, rect.bottom - rect.top,
-        0, 0, 0, 0
-    );
-    SetProp(ctx->hwnd, "kit_Context", ctx);
+    ctx->win_w = w;
+    ctx->win_h = h;
+    
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
+    } else {
+        ctx->window = SDL_CreateWindow(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, ctx->win_w, ctx->win_h, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+        if(ctx->window == NULL) {
+            printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
+        } else {
+            ctx->renderer = SDL_CreateRenderer(ctx->window, -1, 0);
+            ctx->texture = SDL_CreateTexture(ctx->renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STATIC, ctx->screen->w, ctx->screen->h);
 
-    ShowWindow(ctx->hwnd, SW_NORMAL);
-    ctx->hdc = GetDC(ctx->hwnd);
+            SDL_ShowCursor(!ctx->hide_cursor);
 
-    timeBeginPeriod(1);
+        }
+    }
 
     ctx->font = kit_load_font_mem(kit__font_png_data, kit__font_png_size);
     ctx->prev_time = kit__now();
@@ -367,10 +311,13 @@ kit_Context* kit_create(const char *title, int w, int h, int flags) {
 
 
 void kit_destroy(kit_Context *ctx) {
-    ReleaseDC(ctx->hwnd, ctx->hdc);
-    DestroyWindow(ctx->hwnd);
+    SDL_DestroyTexture(ctx->texture);
+    SDL_DestroyRenderer(ctx->renderer);
+    SDL_DestroyWindow( ctx->window );
+
     kit_destroy_font(ctx->font);
     free(ctx);
+    SDL_Quit();
 }
 
 
@@ -385,14 +332,20 @@ int kit_text_width(kit_Font *font, char *text) {
 
 bool kit_step(kit_Context *ctx, double *dt) {
     // present
-    RedrawWindow(ctx->hwnd, 0, 0, RDW_INVALIDATE | RDW_UPDATENOW);
+    kit_Rect wr = kit__get_adjusted_window_rect(ctx);
+    SDL_Rect dst = { wr.x, wr.y, wr.w, wr.h };
+
+    SDL_UpdateTexture(ctx->texture, NULL, ctx->screen->pixels, ctx->screen->w * sizeof(Uint32));
+    SDL_RenderClear(ctx->renderer);
+    SDL_RenderCopy(ctx->renderer, ctx->texture, NULL, &dst);
+    SDL_RenderPresent(ctx->renderer);
 
     // handle delta time / wait for next frame
     double now = kit__now();
     double wait = (ctx->prev_time + ctx->step_time) - now;
     double prev = ctx->prev_time;
     if (wait > 0) {
-        Sleep(wait * 1000);
+        SDL_Delay(wait * 1000);
         ctx->prev_time += ctx->step_time;
     } else {
         ctx->prev_time = now;
@@ -409,10 +362,9 @@ bool kit_step(kit_Context *ctx, double *dt) {
     }
 
     // handle events
-    MSG msg;
-    while (PeekMessage(&msg, ctx->hwnd, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    SDL_Event e; 
+    while (SDL_PollEvent(&e)) {
+        kit__wndproc(ctx, &e);
     }
     return !ctx->wants_quit;
 }

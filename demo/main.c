@@ -19,7 +19,7 @@ int main(void) {
     double dt;
     while (kit_step(ctx, &dt)) {
         // handle keyboard input
-        if (kit_key_pressed(ctx, VK_ESCAPE)) { break; }
+        if (kit_key_pressed(ctx, SDLK_ESCAPE)) { break; }
 
         // get mouse position
         int mx, my;
